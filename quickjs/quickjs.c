@@ -43845,8 +43845,6 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
 
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_OBJECT:
-        if (JS_IsFunction(ctx, val))
-            break;
     case JS_TAG_STRING:
     case JS_TAG_INT:
     case JS_TAG_FLOAT64:
@@ -43917,6 +43915,15 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             goto exception;
         }
 #endif
+#define FUNC_IDENT "<Function>"
+        else if(JS_IsFunction(ctx, val)) {
+            JSValue ident = JS_NewStringLen(ctx, FUNC_IDENT, sizeof(FUNC_IDENT));
+            ret = string_buffer_concat_value_free(jsc->b, ident);
+            JS_FreeValue(ctx, val);
+            return ret;
+        }
+#undef FUNC_IDENT
+
         v = js_array_includes(ctx, jsc->stack, 1, (JSValueConst *)&val);
         if (JS_IsException(v))
             goto exception;
