@@ -28,6 +28,12 @@
 #define QJSPP_TYPENAME(...) #__VA_ARGS__
 #endif
 
+#define JS_CONST_ATOM(ctx, str) (JS_NewAtomLen(ctx, str, sizeof(str) - 1))
+
+static inline JSAtom JS_NewAtom(JSContext *ctx, std::string const & str)
+{
+    return JS_NewAtomLen(ctx, str.c_str(), str.size());
+}
 
 namespace qjs {
 
@@ -149,21 +155,21 @@ struct js_traits<void>
 
 /** Conversion traits for float64/double.
  */
-template <>
-struct js_traits<double>
+template <typename Floating>
+struct js_traits<Floating, std::enable_if_t<std::is_floating_point_v<Floating>>>
 {
     /// @throws exception
-    static double unwrap(JSContext * ctx, JSValueConst v)
+    static Floating unwrap(JSContext * ctx, JSValueConst v)
     {
         double r;
         if(JS_ToFloat64(ctx, &r, v))
             throw exception{ctx};
-        return r;
+        return Floating(r);
     }
 
-    static JSValue wrap(JSContext * ctx, double i) noexcept
+    static JSValue wrap(JSContext * ctx, Floating i) noexcept
     {
-        return JS_NewFloat64(ctx, i);
+        return JS_NewFloat64(ctx, double(i));
     }
 };
 
@@ -1134,6 +1140,22 @@ struct js_property_traits<const char *>
 };
 
 template <>
+struct js_property_traits<std::string>
+{
+    static void set_property(JSContext * ctx, JSValue this_obj, std::string const & name, JSValue value)
+    {
+        int err = JS_SetPropertyStr(ctx, this_obj, name.c_str(), value);
+        if(err < 0)
+            throw exception{ctx};
+    }
+
+    static JSValue get_property(JSContext * ctx, JSValue this_obj, std::string const & name) noexcept
+    {
+        return JS_GetPropertyStr(ctx, this_obj, name.c_str());
+    }
+};
+
+template <>
 struct js_property_traits<uint32_t>
 {
     static void set_property(JSContext * ctx, JSValue this_obj, uint32_t idx, JSValue value)
@@ -1242,6 +1264,8 @@ public:
             throw exception{ctx};
     }
 
+    Value(JSContext * ctx, JSValue&& v) noexcept : v(std::move(v)), ctx(ctx) {}
+
     Value(JSValue&& v) noexcept : v(std::move(v)), ctx(nullptr) {}
 
     Value(const Value& rhs) noexcept
@@ -1285,6 +1309,21 @@ public:
     }
 
     bool isError() const { return JS_IsError(ctx, v); }
+    bool isNumber() const { return JS_IsNumber(v); }
+    bool isBigInt() const { return JS_IsBigInt(ctx, v); }
+    bool isBigFloat() const { return JS_IsBigFloat(v); }
+    bool isBigDecimal() const { return JS_IsBigDecimal(v); }
+    bool isBool() const { return JS_IsBool(v); }
+    bool isNull() const { return JS_IsNull(v); }
+    bool isUndefined() const { return JS_IsUndefined(v); }
+    bool isException() const { return JS_IsException(v); }
+    bool isUninitialized() const { return JS_IsUninitialized(v); }
+    bool isString() const { return JS_IsString(v); }
+    bool isSymbol() const { return JS_IsSymbol(v); }
+    bool isObject() const { return JS_IsObject(v); }
+    bool isArray() const { return JS_IsArray(ctx, v); }
+    bool isFunction() const { return JS_IsFunction(ctx, v); }
+    bool isConstructor() const { return JS_IsConstructor(ctx, v); }
 
     /** Conversion helper function: value.as<T>()
      * @tparam T type to convert to
@@ -1292,6 +1331,9 @@ public:
      * */
     template <typename T>
     auto as() const { return js_traits<std::decay_t<T>>::unwrap(ctx, v); }
+
+    template <typename T>
+    auto as_ref() const { return js_traits<std::decay_t<T&>>::unwrap(ctx, v); }
 
     /** Explicit conversion: static_cast<T>(value) or (T)value */
     template <typename T>
@@ -1306,10 +1348,24 @@ public:
     /** Implicit conversion to JSValue (rvalue only). Example: JSValue v = std::move(value); */
     operator JSValue()&& noexcept { return release(); }
 
+    bool hasProperty(std::string const & key) const
+    {
+        auto str = Value(ctx, key);
+        int ret = hasProperty(str);
+        return ret;
+    }
+
+    bool hasProperty(Value key) const
+    {
+        auto atom = JS_ValueToAtom(ctx, key.v);
+        int ret = JS_GetOwnProperty(ctx, NULL, v, atom);
+        JS_FreeAtom(ctx, atom);
+        return ret;
+    }
 
     /** Access JS properties. Returns proxy type which is implicitly convertible to qjs::Value */
     template <typename Key>
-    detail::property_proxy<Key> operator [](Key key)
+    detail::property_proxy<Key> operator [](Key key) const
     {
         assert(ctx && "Trying to access properties of Value with no JSContext");
         return {ctx, JS_DupValue(ctx, v), std::move(key)};
@@ -1337,7 +1393,8 @@ public:
 
     // add_getter_setter<&T::get_member, &T::set_member>("member");
     template <auto FGet, auto FSet>
-    Value& add_getter_setter(const char * name)
+    std::enable_if_t<!std::is_member_object_pointer_v<decltype(FGet)>, Value&>
+    add_getter_setter(const char * name)
     {
         auto prop = JS_NewAtom(ctx, name);
         using fgetter = fwrapper<FGet, true>;
@@ -1353,9 +1410,45 @@ public:
         return *this;
     }
 
+    // add_getter_setter("member", []() {}, []() {});
+    template <typename FGet, typename FSet>
+    Value& add_getter_setter(const char * name, FGet&& g, FSet&& s)
+    {
+        auto prop = JS_NewAtom(ctx, name);
+        auto fgetter = js_traits<decltype(std::function{std::forward<FGet>(g)})>::wrap(ctx, std::forward<FGet>(g));
+        auto fsetter = js_traits<decltype(std::function{std::forward<FSet>(s)})>::wrap(ctx, std::forward<FSet>(s));
+        int ret = JS_DefinePropertyGetSet(ctx, v, prop,
+                                          fgetter,
+                                          fsetter,
+                                          JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE
+        );
+        JS_FreeAtom(ctx, prop);
+        if(ret < 0)
+            throw exception{ctx};
+        return *this;
+    }
+
     // add_getter<&T::get_member>("member");
+    template <typename FGet>
+    Value& add_getter(const char * name, FGet&& f)
+    {
+        auto prop = JS_NewAtom(ctx, name);
+        auto getter = js_traits<decltype(std::function{std::forward<FGet>(f)})>::wrap(ctx, std::forward<FGet>(f));
+        int ret = JS_DefinePropertyGetSet(ctx, v, prop,
+                                          getter,
+                                          JS_UNDEFINED,
+                                          JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE
+        );
+        JS_FreeAtom(ctx, prop);
+        if(ret < 0)
+            throw exception{ctx};
+        return *this;
+    }
+
+    // add_getter("member", []() {});
     template <auto FGet>
-    Value& add_getter(const char * name)
+    std::enable_if_t<!std::is_member_object_pointer_v<decltype(FGet)>, Value&>
+    add_getter(const char * name)
     {
         auto prop = JS_NewAtom(ctx, name);
         using fgetter = fwrapper<FGet, true>;
@@ -1741,9 +1834,19 @@ public:
     /** returns new Object() */
     Value newObject() { return Value{ctx, JS_NewObject(ctx)}; }
 
+    /** returns new Array() */
+    Value newArray() { return Value{ctx, JS_NewArray(ctx)}; }
+
     /** returns JS value converted from c++ object val */
     template <typename T>
     Value newValue(T&& val) { return Value{ctx, std::forward<T>(val)}; }
+
+    template <typename T>
+    std::enable_if_t<std::is_function_v<T>, Value>
+    newValue(T&& val) {
+        auto fn = js_traits<decltype(std::function{std::forward<T>(val)})>::wrap(ctx, std::forward<T>(val));
+        return Value{ctx, fn};
+    }
 
     /** returns current exception associated with context and clears it. Should be called when qjs::exception is caught */
     Value getException() { return Value{ctx, JS_GetException(ctx)}; }
@@ -1790,6 +1893,11 @@ public:
         void * ptr = JS_GetContextOpaque(ctx);
         assert(ptr);
         return *static_cast<Context *>(ptr);
+    }
+
+    JSRuntime * getRuntime(void)
+    {
+        return JS_GetRuntime(ctx);
     }
 };
 
